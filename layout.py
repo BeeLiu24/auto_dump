@@ -70,6 +70,40 @@ def save_tensor_to_bin(tensor, filename, op_name):
     data_to_save.tofile(filepath)
     print(f"Saved {tensor.shape} tensor to '{filepath}' (dtype: {data_to_save.dtype})")
 
+#-----------待测试------------------ IGNORE ------------------
+def process_aligned(tensor, dim=0, align_bytes=128, bit_width=8):
+    """
+    对张量的指定维度进行字节对齐填充，并将结果保存到二进制文件。
+
+    Args:
+        weight (torch.Tensor): 待处理的张量。
+        filename (str): 输出文件名。
+        op_name (str): 算子名称（透传给 save_tensor_to_bin）。
+        dim (int): 需要对齐的维度索引。
+        align_bytes (int): 对齐的字节数，支持 16, 32, 128, 256, 512。
+        bit_width (int): 每个元素的位宽，支持 4, 8, 16（bfloat16 视为 16）。
+    """
+    # 计算每个元素的字节数
+    elem_size = bit_width / 8.0          # 4bit -> 0.5, 8bit -> 1, 16bit -> 2
+    L = tensor.shape[dim]                # 当前维度的长度（元素个数）
+    cur_bytes = L * elem_size            # 当前维度占用的总字节数
+
+    # 计算对齐后需要的总字节数
+    aligned_bytes = math.ceil(cur_bytes / align_bytes) * align_bytes
+    new_L = int(round(aligned_bytes / elem_size))   # 对齐后的元素个数（必然为整数）
+    padding_size = new_L - L
+
+    # 构建 torch.nn.functional.pad 所需的填充参数
+    # pad 参数的顺序为： (左填充_最后一维, 右填充_最后一维, 左填充_倒数第二维, ..., 左填充_第一维, 右填充_第一维)
+    pad_args = [0] * (2 * tensor.ndim)
+    rev_idx = tensor.ndim - 1 - dim      # 从后往前数的维度索引
+    pad_args[2 * rev_idx + 1] = padding_size   # 只对右侧进行填充，左侧为0
+
+    # 执行填充
+    padded_tensor = F.pad(tensor, tuple(pad_args))
+    return padded_tensor
+    
+
 
 # ══════════════════════════════════════════════════════════════════
 # activate
@@ -198,10 +232,28 @@ def process_4bit_packed_int8(proj_weight, n_row, n_col):
 
     B, _, _ = proj_weight.shape
 
+    block_h = 32
+    block_w = 16
+
+    # -----------------------------------
+    # 1. 计算 padding 后尺寸
+    # -----------------------------------
+    pad_row = math.ceil(n_row / block_h) * block_h
+    pad_col = math.ceil(n_col / block_w) * block_w
+
+    pad_h = pad_row - n_row
+    pad_w = pad_col - n_col
+
+    # -----------------------------------
+    # 2. padding
+    # -----------------------------------
+    
+    padded = F.pad(proj_weight, (0, pad_w, 0, pad_h))
+
     # ------------------------------------------------
     # 2. reshape 做 int4 pack
     # ------------------------------------------------
-    proj_weight_reshaped = proj_weight.reshape(B, n_row // 2, 2, n_col).to(torch.int8)
+    proj_weight_reshaped = padded.reshape(B, n_row // 2, 2, n_col).to(torch.int8)
 
     low_part  = proj_weight_reshaped[:, :, 0, :]
     high_part = proj_weight_reshaped[:, :, 1, :] << 4
@@ -352,7 +404,39 @@ def encode_weight_to_mxfp4(x):
 
     return result_indices
 
+#-----------待测试------------------ IGNORE ------------------
+def process_bf16_weight(proj_weight, n_row, n_col):
+    # ------------------------------------------------
+    # 1. 计算 padding 后尺寸
+    # ------------------------------------------------
+    block_size = 16
 
+    pad_row = math.ceil(n_row / block_size) * block_size
+    pad_col = math.ceil(n_col / block_size) * block_size
+
+    pad_h = pad_row - n_row
+    pad_w = pad_col - n_col
+
+    # ------------------------------------------------
+    # 2. padding
+    # ------------------------------------------------
+    padded = F.pad(proj_weight, (0, pad_w, 0, pad_h))
+
+    block_size = 16
+    blocks = torch.split(proj_weight, split_size_or_sections=block_size, dim=0)  # tuple of (K // 16) x [16, N]
+    transposed_blocks = [blk.transpose(0, 1) for blk in blocks]  # each [16, N] -> [N, 16]
+    stacked_blocks = torch.stack(transposed_blocks, dim=0)  # shape: [K // 16, N, 16]
+    flat_blocked = stacked_blocks.reshape(-1)  # shape: ((K // 16) * N * 16,)
+
+    return flat_blocked
+
+#-----------待测试------------------ IGNORE ------------------
+def process_norm_weight(weight, filename, op_name):
+
+    block_size = 128
+    padding_size = math.ceil(weight.shape[0] / block_size) * block_size - weight.shape[0]
+    pad = F.pad(weight, (0, padding_size))
+    save_tensor_to_bin(pad, filename, op_name)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -514,6 +598,9 @@ def save_fp8_act_scales_blocked(scales_fp8, filename, op_name):
     block_h = 16
     block_w = 32
 
+    n_row = scales_fp8.shape[-2]
+    n_col = scales_fp8.shape[-1]
+
      # -----------------------------------
     # 1. 计算 padding 后尺寸
     # -----------------------------------
@@ -531,12 +618,12 @@ def save_fp8_act_scales_blocked(scales_fp8, filename, op_name):
         padded = F.pad(scales_fp8, (0, pad_w, 0, pad_h))
         padded = padded.unsqueeze(0)  # 统一成 3D
 
-    elif scales_int8.dim() == 3:
+    elif scales_fp8.dim() == 3:
 
-        padded = F.pad(scales_int8, (0, pad_w, 0, pad_h))
+        padded = F.pad(scales_fp8, (0, pad_w, 0, pad_h))
 
     else:
-        raise ValueError("scales_int8 must be 2D or 3D tensor")
+        raise ValueError("scales_fp8 must be 2D or 3D tensor")
 
     B, H, W = padded.shape
 
@@ -574,38 +661,37 @@ def save_fp8_act_scales_blocked(scales_fp8, filename, op_name):
 
 def save_fp8_weight_scales_blocked(scales_fp8, filename, op_name):
     """
-    将 scales_fp8 (128, 64) 按 16x16 分块，得到 (8, 4) 个 block。
+    将 scales_fp8 (128, 64) 按 32x16 分块，得到 (4, 4) 个 block。
     存储顺序：
-        - 外循环：按 block 矩阵的列优先顺序（即 j 在外，i 在内）
+        - 外循环：按 block 矩阵的列优先顺序（即 i 在外，j 在内）
         - 内部数据：每个 block 按列优先顺序存储（即先存第0列16个元素）
-    每个 block 512 字节（16*16*2）
+    每个 block 512 字节（32*16）
     """
     block_size_h = 32
     block_size_w = 16
-    n_block_h = scales_fp8.shape[0] // block_size_h  # 8
+    n_block_h = scales_fp8.shape[0] // block_size_h  # 4
     n_block_w = scales_fp8.shape[1] // block_size_w   # 4
 
     # assert scales_fp8.shape == (128, 64), f"Expected (128, 64), got {scales_fp8.shape}"
     assert scales_fp8.dtype == torch.float8_e4m3fn, f"Expected fp8, got {scales_fp8.dtype}"
 
-    # 重新 reshape 成 block 结构: (8, 16, 4, 16) -> (n_block_h, block_size, n_block_w, block_size)
+    # 重新 reshape 成 block 结构: (4, 32, 4, 16) -> (n_block_h, block_size, n_block_w, block_size)
     # 然后调整为 (n_block_h, n_block_w, 16, 16) 便于索引
     scales_reshaped = scales_fp8.view(n_block_h, block_size_h, n_block_w, block_size_w)
     
-    # 转置为 (n_block_h, n_block_w, 16, 16)
+    # 转置为 (n_block_h, n_block_w, 32, 16)
     blocks = scales_reshaped.permute(0, 2, 1, 3).contiguous()
 
-    SAVE_ROOT = "/root/autodl-tmp/project/Qwen3/golden_data"
+    SAVE_ROOT = "/root/autodl-tmp/project/golden_data"
     save_dir = os.path.join(SAVE_ROOT, op_name)
     os.makedirs(save_dir, exist_ok=True)
     scales_bin_path = os.path.join(save_dir, filename)
 
     with open(scales_bin_path, 'wb') as f:
-        # 外循环：按 block 矩阵的列优先顺序 (j, i)        
+        # 外循环：按 block 矩阵的行优先顺序 (i, j)        
         for i in range(n_block_h):
             for j in range(n_block_w):
-                block = blocks[i, j]    # shape (16, 16), 行优先存储在内存中
-                # 要按列优先写入：转置 block → (16, 16) 列优先等价于转置后行优先
+                block = blocks[i, j]    # shape (32, 16), 行优先存储在内存中
                 block_col_major = block.contiguous()
                 data_uint16 = block_col_major.view(torch.uint16)
                 f.write(data_uint16.cpu().numpy().tobytes())
@@ -656,7 +742,7 @@ def save_mask_to_bin(mask_bool, filename, op_name, hw32=False):
     # 保存为二进制文件
     if hw32:
         packed = torch.Tensor(packed_mask.reshape(M, -1)).to(torch.uint16).reshape(int(M/128), 128, -1)
-        act_matrix_layout(packed, filename, op_name, block2=8)
+        act_slicehw_layout(packed, filename, op_name, block2=8)
     else:
         packed_mask.tofile(filepath)
     print(f"Saved mask {mask_bool.shape} to '{filepath}' as {total_uint16} uint16 values (packed)")
